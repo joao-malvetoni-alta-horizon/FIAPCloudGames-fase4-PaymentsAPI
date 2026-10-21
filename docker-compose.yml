@@ -1,0 +1,86 @@
+# Sobe o PaymentsAPI completo (API + PostgreSQL + RabbitMQ) para executar o serviço isolado
+# com `docker compose up`. Os nomes dos serviços (db, rabbitmq) batem com os hosts do
+# appsettings.json, então a API os alcança dentro da rede do compose.
+#
+# PaymentProcessedEvent é publicado em DOIS transportes: RabbitMQ (consumido pelo
+# CatalogAPI, que adiciona o jogo à biblioteca) e SNS (consumido pela Lambda do
+# NotificationsAPI, que envia o email). SNS exige credenciais AWS reais no ambiente
+# (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION); sem elas, só essa publicação
+# falha silenciosamente (log de warning) — o RabbitMQ continua funcionando normalmente.
+#
+# Observação: este RabbitMQ é local a este repositório. Para rodar o fluxo completo entre os
+# microsserviços (Catalog -> Payments -> Notifications) use o repositório de orquestração, onde
+# todos compartilham o mesmo broker.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fcg_payments
+      POSTGRES_USER: fcg
+      POSTGRES_PASSWORD: fcg123
+    ports:
+      - "5432:5432" # exposto no host para desenvolvimento local (dotnet run)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fcg -d fcg_payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: fcg
+      RABBITMQ_DEFAULT_PASS: fcg123
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # painel de gerenciamento (http://localhost:15672)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: paymentsredis
+    command: >
+      redis-server
+      --user default off
+      --user payments on ">pass" "~*" "&*" "+@all"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--user", "catalog", "--pass", "pass", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  payments-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__DefaultConnection: "Host=db;Port=5432;Database=fcg_payments;Username=fcg;Password=fcg123"
+      RabbitMq__Host: rabbitmq
+      Sns__TopicArn: ${SNS_PAYMENT_EVENTS_TOPIC_ARN:-arn:aws:sns:us-east-1:450753703903:fcg-payment-events}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
+  redis_data:
